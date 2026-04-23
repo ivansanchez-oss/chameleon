@@ -94,6 +94,11 @@ impl KeyboardFilter {
     /// Subscribe to keyboard PnP events. The returned [`Watcher`] keeps the
     /// subscription alive; drop it to stop.
     pub fn watch(&self) -> Result<Watcher, Error> {
+        if !any_keyboard_present() {
+            tracing::info!("no keyboard present at startup, applying default layout");
+            switch_layout(self.default_layout.klid());
+        }
+
         let state = Box::new(WatchState {
             default_layout: self.default_layout.clone(),
             on_connect: self.on_connect.clone(),
@@ -205,6 +210,22 @@ unsafe fn device_symbolic_link(event_data: *const CM_NOTIFY_EVENT_DATA) -> Strin
             len += 1;
         }
         String::from_utf16_lossy(std::slice::from_raw_parts(start, len))
+    }
+}
+
+// Returns true if at least one device interface for the keyboard class is
+// currently present. The size API returns 1 (just the multi-string terminator)
+// when the list is empty, so anything greater means at least one device.
+fn any_keyboard_present() -> bool {
+    unsafe {
+        let mut len: u32 = 0;
+        let cr = CM_Get_Device_Interface_List_SizeW(
+            &mut len,
+            &GUID_DEVINTERFACE_KEYBOARD,
+            PCWSTR::null(),
+            CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+        );
+        cr == CR_SUCCESS && len > 1
     }
 }
 
