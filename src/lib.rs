@@ -19,7 +19,8 @@ const GUID_DEVINTERFACE_KEYBOARD: GUID = GUID::from_u128(0x884b96c3_56ef_11d1_bc
 /// A Windows keyboard layout identified by its KLID string.
 ///
 /// See <https://learn.microsoft.com/en-us/windows/win32/intl/language-identifier-constants-and-strings>.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(from = "String")]
 #[non_exhaustive]
 pub enum KeyboardLayout {
     EnglishUS,
@@ -51,6 +52,22 @@ impl KeyboardLayout {
     }
 }
 
+impl From<String> for KeyboardLayout {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "EnglishUS" => Self::EnglishUS,
+            "EnglishUK" => Self::EnglishUK,
+            "SpanishLatinAmerica" => Self::SpanishLatinAmerica,
+            "SpanishSpain" => Self::SpanishSpain,
+            "French" => Self::French,
+            "German" => Self::German,
+            "PortugueseBrazil" => Self::PortugueseBrazil,
+            "Italian" => Self::Italian,
+            _ => Self::Custom(s),
+        }
+    }
+}
+
 /// Errors returned by the chamaleon API.
 #[derive(Debug)]
 pub enum Error {
@@ -73,10 +90,17 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Per-keyboard configuration entry.
+#[derive(Debug, Clone)]
+struct KeyboardEntry {
+    alias: Option<String>,
+    layout: KeyboardLayout,
+}
+
 /// Watches PnP keyboard connect/disconnect events and switches the active layout.
 pub struct KeyboardFilter {
     default_layout: KeyboardLayout,
-    on_connect: HashMap<String, KeyboardLayout>,
+    on_connect: HashMap<String, KeyboardEntry>,
 }
 
 impl KeyboardFilter {
@@ -92,21 +116,18 @@ impl KeyboardFilter {
         &self.default_layout
     }
 
-    pub fn on_connect(&self) -> &HashMap<String, KeyboardLayout> {
-        &self.on_connect
-    }
-
     /// Subscribe to keyboard PnP events. The returned [`Watcher`] keeps the
     /// subscription alive; drop it to stop.
     pub fn watch(&self) -> Result<Watcher, Error> {
         let present = present_keyboard_ids();
         match present.iter().find_map(|id| self.on_connect.get(id)) {
-            Some(layout) => {
+            Some(entry) => {
                 tracing::info!(
-                    klid = layout.klid(),
+                    alias = entry.alias.as_deref().unwrap_or("-"),
+                    klid = entry.layout.klid(),
                     "configured keyboard present at startup"
                 );
-                switch_layout(layout.klid());
+                switch_layout(entry.layout.klid());
             }
             None => {
                 tracing::info!("no configured keyboard present at startup, applying default");
@@ -148,7 +169,7 @@ impl KeyboardFilter {
 
 pub struct KeyboardFilterBuilder {
     default_layout: Option<KeyboardLayout>,
-    on_connect: HashMap<String, KeyboardLayout>,
+    on_connect: HashMap<String, KeyboardEntry>,
 }
 
 impl KeyboardFilterBuilder {
@@ -162,9 +183,18 @@ impl KeyboardFilterBuilder {
     /// Register a layout to apply when the keyboard with the given identifier
     /// connects. The identifier is the `VID_xxxx&PID_xxxx` substring of the
     /// device's symbolic link, e.g. `"VID_258A&PID_002A"` (case-insensitive).
-    /// Call multiple times to configure several keyboards.
-    pub fn on_connect(mut self, id: impl Into<String>, layout: KeyboardLayout) -> Self {
-        self.on_connect.insert(id.into().to_ascii_uppercase(), layout);
+    /// `alias` is optional and only used in logs. Call multiple times to
+    /// configure several keyboards.
+    pub fn on_connect(
+        mut self,
+        id: impl Into<String>,
+        alias: Option<String>,
+        layout: KeyboardLayout,
+    ) -> Self {
+        self.on_connect.insert(
+            id.into().to_ascii_uppercase(),
+            KeyboardEntry { alias, layout },
+        );
         self
     }
 
@@ -192,7 +222,7 @@ impl Drop for Watcher {
 
 struct WatchState {
     default_layout: KeyboardLayout,
-    on_connect: HashMap<String, KeyboardLayout>,
+    on_connect: HashMap<String, KeyboardEntry>,
 }
 
 unsafe extern "system" fn notify_callback(
@@ -208,10 +238,18 @@ unsafe extern "system" fn notify_callback(
     match action {
         CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL => {
             let key = device_key(&device);
-            tracing::info!(device = %device, id = %key, "keyboard connected");
             match state.on_connect.get(&key) {
-                Some(layout) => switch_layout(layout.klid()),
-                None => tracing::info!(id = %key, "keyboard has no configuration"),
+                Some(entry) => {
+                    tracing::info!(
+                        id = %key,
+                        alias = entry.alias.as_deref().unwrap_or("-"),
+                        "keyboard connected"
+                    );
+                    switch_layout(entry.layout.klid());
+                }
+                None => {
+                    tracing::info!(id = %key, "keyboard connected (no configuration)");
+                }
             }
         }
         CM_NOTIFY_ACTION_DEVICEINTERFACEREMOVAL => {
@@ -243,8 +281,7 @@ unsafe fn device_symbolic_link(event_data: *const CM_NOTIFY_EVENT_DATA) -> Strin
         return String::new();
     }
     unsafe {
-        let start =
-            std::ptr::addr_of!((*event_data).u.DeviceInterface.SymbolicLink) as *const u16;
+        let start = std::ptr::addr_of!((*event_data).u.DeviceInterface.SymbolicLink) as *const u16;
         let mut len = 0usize;
         while len < 4096 && *start.add(len) != 0 {
             len += 1;
